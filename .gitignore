@@ -1,0 +1,11 @@
+.local/
+__pycache__/
+*.pyc
+node_modules/
+dist/
+.venv/
+.env
+.env.*
+!.env.example
+config.local.json
+*.log

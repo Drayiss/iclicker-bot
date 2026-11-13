@@ -1,0 +1,22 @@
+{
+  "provider": "codex",
+  "model": "gpt-6.1-sol",
+  "fallback_models": ["gpt-6.1-terra", "gpt-6-sol", "gpt-5.4"],
+  "codex_path": "codex",
+  "api_key": "",
+  "discord_webhook": "",
+  "solver_timeout": 90,
+  "random_fallback": true,
+  "random_wait_seconds": 12,
+  "selectors": {
+    "question": "",
+    "questionId": "",
+    "options": "",
+    "textInput": "",
+    "submit": "",
+    "join": "",
+    "active": "",
+    "ended": "",
+    "submitted": ""
+  }
+}

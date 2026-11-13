@@ -1,0 +1,19 @@
+{
+  "checked_on": "2026-11-12",
+  "node": {
+    "version": "26.13.1",
+    "channel": "LTS",
+    "directory": "node-v26.13.1-win-x64",
+    "url": "https://nodejs.org/dist/v26.13.1/node-v26.13.1-win-x64.zip",
+    "sha256": "e2edda75bfb089654705cf65a13b58933bfd5f57148e8ebda916f58a2474f1f7"
+  },
+  "python": {
+    "version": "3.15.2",
+    "channel": "stable",
+    "directory": "python-3.15.2",
+    "url": "https://www.python.org/ftp/python/3.15.2/python-3.15.2-embed-amd64.zip",
+    "sha256": "d012f3aa29cf07436dae8aea1fec0fd195c2612a0b059b1f915ae0afb9ad1f62"
+  },
+  "codex": {"version": "0.167.2", "channel": "stable"},
+  "edge": {"version": "157.0.4341.42", "channel": "stable"}
+}
