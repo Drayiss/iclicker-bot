@@ -2,6 +2,7 @@ const token = document.querySelector('meta[name="pairing-token"]').content;
 const $ = id => document.getElementById(id);
 let initialized = false;
 let lastEvents = '';
+let webhookRevision = 0;
 async function api(path, data) {
   const response = await fetch(path,{method:data ? 'POST':'GET',headers:{'Authorization':`Bearer ${token}`,'Content-Type':'application/json'},body:data ? JSON.stringify(data):undefined,signal:AbortSignal.timeout(10000)});
   const result = await response.json();
@@ -9,6 +10,11 @@ async function api(path, data) {
   return result;
 }
 function notice(message='') {$('notice').textContent=message;$('notice').hidden=!message;}
+async function loadWebhook() {
+  const revision=webhookRevision;
+  const settings=await api('/api/settings-form');
+  if(revision===webhookRevision) $('webhook').value=settings.discord_webhook || '';
+}
 function render(state) {
   $('status').textContent=state.status;
   $('connection').textContent=state.connected ? `Edge connected · last check ${state.last_seen_seconds}s ago · ${state.poll_seconds??3}-second polling` : state.bridge_connected ? 'Edge extension connected; the selected tab needs attention.' : 'Waiting for Edge extension';
@@ -28,7 +34,7 @@ function render(state) {
     $('random').checked=settings.random_fallback === true;$('random-wait').value=settings.random_wait_seconds ?? 12;
     $('pairing').value=token;initialized=true;
   }
-  $('secrets').textContent=`Discord ${settings.discord_webhook_set?'saved':'not configured'} · API key ${settings.api_key_set?'saved':'not configured'}. Blank fields keep saved values.`;
+  $('secrets').textContent=`Discord ${settings.discord_webhook_set?'saved':'not configured'} · API key ${settings.api_key_set?'saved':'not configured'}. Your saved webhook loads automatically. Blank fields keep saved values.`;
   const events=JSON.stringify(state.events);
   if(events!==lastEvents){
     lastEvents=events;$('events').replaceChildren();
@@ -44,13 +50,15 @@ async function act(path,data={}) {try{notice();render(await api(path,data));retu
 $('start').onclick=()=>act('/api/start');$('stop').onclick=()=>act('/api/stop');
 $('retry').onclick=()=>act('/api/retry');$('test').onclick=()=>act('/api/test-alert');
 $('copy').onclick=async()=>{try{await navigator.clipboard.writeText(token);$('copy').textContent='Copied';setTimeout(()=>$('copy').textContent='Copy',1800);}catch{$('pairing').type='text';$('pairing').select();}};
+$('webhook').oninput=()=>{webhookRevision++;};
 $('settings').onsubmit=async event=>{
   event.preventDefault();
+  const revision=++webhookRevision;
   try{
     const settings={provider:$('provider').value,model:$('model').value.trim(),fallback_models:$('fallback').value.split(',').map(s=>s.trim()).filter(Boolean),codex_path:$('codex').value.trim()||'codex',api_key:$('key').value.trim(),discord_webhook:$('webhook').value.trim(),solver_timeout:Number($('timeout').value),selectors:JSON.parse($('selectors').value)};
     settings.random_fallback=$('random').checked;settings.random_wait_seconds=Number($('random-wait').value);
-    if(await act('/api/settings',settings)){$('key').value='';$('webhook').value='';}
+    if(await act('/api/settings',settings)){$('key').value='';if(revision===webhookRevision) await loadWebhook();}
   }catch(error){notice(error.message);}
 };
 async function refresh(){try{render(await api('/api/state'));}catch(error){notice('The PC app is unavailable. Restart Start-iClicker-Bot.cmd.');}}
-refresh();setInterval(refresh,2000);
+refresh();loadWebhook().catch(()=>notice('Could not load the saved Discord webhook. Reload the panel to try again.'));setInterval(refresh,2000);

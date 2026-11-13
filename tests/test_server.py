@@ -46,6 +46,39 @@ class ServerTests(unittest.TestCase):
     def test_state_requires_auth(self):
         with self.request("/api/state", authenticated=False) as response: self.assertEqual(response.status, 401)
 
+    def test_settings_form_requires_auth(self):
+        with self.request("/api/settings-form", authenticated=False) as response:
+            self.assertEqual(response.status, 401)
+
+    def test_settings_form_returns_saved_webhook_but_no_api_key(self):
+        webhook = "https://discord.com/api/webhooks/123/test"
+        with self.request("/api/settings", {"api_key": "TEST_SECRET", "discord_webhook": webhook}): pass
+        with self.request("/api/settings-form", headers={"Sec-Fetch-Site": "same-origin"}) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(response.read()), {"discord_webhook": webhook})
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+    def test_settings_form_rejects_cross_origin_and_extension_reads(self):
+        for headers in ({"Origin": "chrome-extension://test"}, {"Origin": "https://attacker.example"}, {"Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site"}):
+            with self.subTest(headers=headers), self.request("/api/settings-form", headers=headers) as response:
+                self.assertEqual(response.status, 403)
+                self.assertIsNone(response.headers.get("Access-Control-Allow-Origin"))
+                self.assertNotIn("https://discord.com/api/webhooks", response.read().decode())
+
+    def test_webhook_is_loaded_from_disk_after_restart(self):
+        webhook = "https://discord.com/api/webhooks/456/restart-test"
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "config.json").write_text(json.dumps({"discord_webhook": webhook}), encoding="utf-8")
+            original = self.server
+            self.server = make_server(Path(directory), port=0)
+            try:
+                with self.request("/api/settings-form") as response:
+                    self.assertEqual(json.loads(response.read()), {"discord_webhook": webhook})
+            finally:
+                self.server.server_close()
+                self.server.engine.pool.shutdown()
+                self.server = original
+
     def test_settings_and_poll_require_auth(self):
         for path in ("/api/settings", "/api/poll", "/api/start"):
             with self.request(path, {}, authenticated=False) as response: self.assertEqual(response.status, 401)

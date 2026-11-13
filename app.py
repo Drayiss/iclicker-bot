@@ -40,7 +40,7 @@ def make_server(directory=None, port=8765):
             origin = self.headers.get("Origin", "")
             # The pairing token is embedded in the local panel. Other installed
             # extensions must not be able to fetch that HTML to discover it.
-            if self.path.startswith("/api/") and origin.startswith("chrome-extension://"):
+            if self.path.startswith("/api/") and self.path != "/api/settings-form" and origin.startswith("chrome-extension://"):
                 self.send_header("Access-Control-Allow-Origin", origin)
                 self.send_header("Vary", "Origin")
                 self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
@@ -82,6 +82,18 @@ def make_server(directory=None, port=8765):
                 return self.send(200, path.read_text(encoding="utf-8"), "text/javascript" if path.suffix == ".js" else "text/css")
             if self.path == "/demo":
                 return self.send(200, (ROOT / "web" / "demo.html").read_text(encoding="utf-8"), "text/html")
+            if self.path == "/api/settings-form":
+                if not self.authorized():
+                    return self.send(401, {"error": "Unauthorized"})
+                # Only the local settings panel needs the saved webhook. Keep it
+                # out of regular state/extension responses and cross-origin reads.
+                origin = self.headers.get("Origin", "")
+                site = self.headers.get("Sec-Fetch-Site", "")
+                if origin not in ("", f"http://127.0.0.1:{self.server.server_port}") or site not in ("", "none", "same-origin"):
+                    return self.send(403, {"error": "Local settings panel only"})
+                with engine.lock:
+                    settings = {"discord_webhook": engine.config["discord_webhook"]}
+                return self.send(200, settings)
             if self.path == "/api/state":
                 if not self.authorized():
                     return self.send(401, {"error": "Unauthorized"})
