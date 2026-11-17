@@ -89,12 +89,16 @@ class SolverTests(unittest.TestCase):
         with patch("shutil.which", return_value="codex.exe"), patch("iclicker_bot.solver.run_solver_process", side_effect=run):
             self.assertEqual(solver.solve(self.snapshot)["model"], DEFAULTS["model"])
 
-    def test_random_fallback_budget_respects_visible_time_remaining(self):
+    def test_solver_continues_past_random_wait_but_respects_poll_deadline(self):
         config=copy.deepcopy(DEFAULTS)
         config.update(random_fallback=True,random_wait_seconds=12,solver_timeout=90)
         solver=Solver(config)
-        self.assertEqual(solver.timeout_for({}),12)
+        self.assertEqual(solver.timeout_for({}),90)
         self.assertEqual(solver.timeout_for({"remainingSeconds":8}),5)
+        with patch("time.monotonic", return_value=100):
+            solver.deadline = 190
+        with patch("time.monotonic", return_value=115):
+            self.assertEqual(solver.timeout_for({}),75)
 
     def test_all_model_attempts_share_one_time_budget(self):
         config=copy.deepcopy(DEFAULTS)

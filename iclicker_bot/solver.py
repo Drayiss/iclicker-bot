@@ -69,7 +69,7 @@ def terminate_solver_tree(process):
 
 def run_solver_process(args, *, input, timeout, cwd, **_):
     # The npm wrapper spawns a native child. Kill the entire owned tree on a
-    # deadline, so random fallback does not leave an orphaned solver running.
+    # final solver deadline, so an expired solve does not leave an orphan running.
     process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, encoding="utf-8", errors="replace", cwd=cwd,
                                start_new_session=os.name != "nt",
@@ -138,8 +138,8 @@ class Solver:
 
     def timeout_for(self, snapshot):
         timeout = self.config["solver_timeout"]
-        if self.config.get("random_fallback"):
-            timeout = min(timeout, self.config.get("random_wait_seconds", 12))
+        # Random submission has its own timer in Engine. Keep solving afterward
+        # so a late answer can replace the confirmed random choice.
         remaining = snapshot.get("remainingSeconds")
         if isinstance(remaining, (int, float)) and remaining > 0:
             timeout = min(timeout, max(1, remaining - 3))

@@ -42,6 +42,10 @@ class Engine:
         self.snapshot = {}
         self.pending = None
         self.inflight = None
+        self.solve_started_at = None
+        self.random_due_at = None
+        self.solve_generation = None
+        self.random_submission = None
         self.generation = 0
         self.announced = set()
         self.joined = set()
@@ -145,6 +149,7 @@ class Engine:
 
     def watchdog(self):
         with self.lock:
+            self._maybe_random()
             if self.running and time.monotonic() - max(self.last_seen, self.started_at) > 20:
                 self.status = "Edge connection lost"
                 self.pending = None
@@ -172,6 +177,7 @@ class Engine:
 
     def work_state(self):
         with self.lock:
+            self._maybe_random()
             return {"running":self.running, "solving":bool(self.inflight),
                     "ready":bool(self.pending and not self.pending.get("dispatched"))}
 
@@ -188,6 +194,42 @@ class Engine:
 
     def _history_status(self, fingerprint):
         return self.history.get(self._history_key(fingerprint), self.history.get(fingerprint))
+
+    def _random_for(self, fingerprint):
+        record = self.random_submission
+        if record and record["fingerprint"] == fingerprint and record["generation"] == self.generation and record["class_run"] == self.class_run:
+            return record
+        return None
+
+    def _maybe_random(self):
+        if (self.running and self.inflight == self.snapshot.get("fingerprint")
+                and self.solve_generation == self.generation and self.random_due_at is not None
+                and time.monotonic() >= self.random_due_at and not self.pending):
+            self._queue_random(self.snapshot, "The random-answer wait elapsed; the solver is still working.")
+
+    def _queue_correction(self, snapshot):
+        record = self._random_for(snapshot.get("fingerprint"))
+        if not record or record["status"] != "confirmed" or not record.get("solved") or self.pending:
+            return False
+        answer = record["solved"]
+        if answer == record["answer"]:
+            record["status"] = "complete"
+            self.record("info", "The solved answer matches the confirmed random choice; no resubmission is needed.")
+            return False
+        if not (snapshot.get("state") == "question" or (snapshot.get("state") == "submitted" and snapshot.get("resubmittable"))):
+            return False
+        if not snapshot.get("controlsClear") or snapshot.get("inputKind") != "single" or snapshot.get("remainingSeconds") == 0:
+            return False
+        selected = snapshot.get("selectedOptionIds", [])
+        if selected and selected != record["answer"]["option_ids"]:
+            record["status"] = "cancelled"
+            self.alert_once("correction:" + record["id"], "The selected answer changed after the random submission. The late solver answer will not overwrite that edit.")
+            return False
+        record["status"] = "correcting"
+        self.pending = {"id": str(uuid.uuid4()), "kind": "answer", "fingerprint": record["fingerprint"],
+                        "supersedes": record["id"], "previous_answer": deepcopy(record["answer"]), "answer": deepcopy(answer)}
+        self.status = "Solved answer ready — replacing the random choice"
+        return True
 
     def poll(self, payload):
         with self.lock:
@@ -217,6 +259,9 @@ class Engine:
                     if command["kind"] == "answer":
                         # Persist BEFORE sending. A crash or lost acknowledgment never causes a duplicate.
                         self._remember(command["fingerprint"], "dispatched")
+                        record = self._random_for(command["fingerprint"])
+                        if command.get("random_fallback") and record:
+                            record["status"] = "dispatched"
                 else:
                     self.pending = None
             if self.pending and self.pending.get("dispatched") and time.monotonic() - self.pending["sent_at"] > 20:
@@ -232,10 +277,24 @@ class Engine:
         if result.get("ok"):
             if command["kind"] == "answer":
                 self._remember(command["fingerprint"], "submitted")
-                self.record("info", "Random fallback answer submitted and confirmed. You can change it while the poll is open." if command.get("random_fallback") else "Answer submitted and confirmed in the page.")
+                record = self._random_for(command["fingerprint"])
+                if command.get("random_fallback") and record and record["id"] == command["id"]:
+                    record["status"] = "confirmed"
+                elif command.get("supersedes") and record:
+                    record["status"] = "complete"
+                if command.get("random_fallback"):
+                    message = "Random fallback answer submitted and confirmed. If a solved answer becomes available, it can replace this choice while the poll remains open."
+                elif command.get("supersedes"):
+                    message = "Solved answer replaced the random choice and was confirmed in the page."
+                else:
+                    message = "Answer submitted and confirmed in the page."
+                self.record("info", message)
             else:
                 self.record("info", "Joined the class.")
         else:
+            record = self._random_for(command["fingerprint"])
+            if record and (command.get("random_fallback") or command.get("supersedes")):
+                record["status"] = "failed"
             self.alert_once("action:" + command["id"], result.get("message", "Browser action failed. Check the selected tab."))
 
     def _advance(self, snapshot):
@@ -246,6 +305,8 @@ class Engine:
             self.alert_once("network:" + str(signal.get("key", "question")), "iClicker announced a new question, but its live question controls are not readable in the selected tab. Open the live course/poll page. No random choice is possible without clear answer controls.")
         if self.pending:
             if self.pending["fingerprint"] != fingerprint:
+                self.pending = None
+            elif self.pending.get("supersedes") and not (state == "question" or (state == "submitted" and snapshot.get("resubmittable"))) and not self.pending.get("dispatched"):
                 self.pending = None
             else:
                 return
@@ -287,8 +348,11 @@ class Engine:
         if state == "waiting":
             self.status = "Joined — waiting for next question"
             return
+        if self._queue_correction(snapshot):
+            return
         if state == "submitted":
-            self.status = "Answer recorded — waiting for next question"
+            record = self._random_for(fingerprint)
+            self.status = "Random answer recorded — solver still working" if record and self.inflight == fingerprint else "Answer recorded — waiting for next question"
             if fingerprint:
                 self._remember(fingerprint, "submitted")
             return
@@ -325,11 +389,19 @@ class Engine:
             return
         if self.inflight is not None:
             self.status = "Solving question"
+            self._maybe_random()
             return
         self.status = "Solving question"
         generation = self.generation
         solver = self.solver
         self.inflight = fingerprint
+        self.solve_generation = generation
+        self.solve_started_at = time.monotonic()
+        delay = self.config.get("random_wait_seconds", 12)
+        remaining = snapshot.get("remainingSeconds")
+        if isinstance(remaining, (int, float)) and remaining > 0:
+            delay = min(delay, max(0, remaining - 3))
+        self.random_due_at = self.solve_started_at + delay
         self.record("info", "New question captured. Starting a fresh solver with its text, options and figures.")
         future = self.pool.submit(solver.solve, deepcopy(snapshot))
         future.add_done_callback(lambda f: self._solved(f, fingerprint, generation))
@@ -337,11 +409,15 @@ class Engine:
     def _solved(self, future, fingerprint, generation):
         with self.lock:
             self.inflight = None
+            self.random_due_at = None
             if not self.running or generation != self.generation or self.snapshot.get("fingerprint") != fingerprint:
                 return
-            if self.snapshot.get("state") != "question":
+            record = self._random_for(fingerprint)
+            if self.snapshot.get("state") not in ("question", "submitted"):
                 return
-            if self._history_status(fingerprint) in ("dispatched", "submitted") or (self.pending and self.pending.get("random_fallback")):
+            if record and record["status"] not in ("queued", "dispatched", "confirmed"):
+                return
+            if not record and self._history_status(fingerprint) in ("dispatched", "submitted"):
                 return
             try:
                 answer = future.result()
@@ -349,6 +425,9 @@ class Engine:
                 # Solver exceptions are curated; unexpected exceptions never leak credential-bearing details.
                 from .solver import SolverError
                 message = str(error) if isinstance(error, SolverError) else "Question solver failed unexpectedly; no answer was submitted."
+                if record:
+                    self.alert_once("solver:" + fingerprint, message + " No solved replacement is available; check the random answer.")
+                    return
                 if self._queue_random(self.snapshot, message):
                     return
                 self._remember(fingerprint, "blocked")
@@ -356,6 +435,9 @@ class Engine:
                 self.alert_once("solver:" + fingerprint, message)
                 return
             if answer["status"] != "answer":
+                if record:
+                    self.alert_once("solver:" + fingerprint, "Solver needs help: " + answer["reason"] + " The random answer has no solved replacement.")
+                    return
                 if self._queue_random(self.snapshot, "Solver needs help: " + answer["reason"]):
                     return
                 self._remember(fingerprint, "blocked")
@@ -363,9 +445,18 @@ class Engine:
                 self.alert_once("solver:" + fingerprint, "Solver needs help: " + answer["reason"])
                 return
             self.record("info", f"Solver {answer.get('model', 'configured model')} returned an answer; rechecking the question before submission.")
+            solved = {k: answer[k] for k in ("option_ids", "text_answer")}
+            if record:
+                if self.pending and self.pending.get("random_fallback") and not self.pending.get("dispatched"):
+                    self.pending = None
+                    self.random_submission = None
+                else:
+                    record["solved"] = solved
+                    self._queue_correction(self.snapshot)
+                    return
             self.status = "Answer ready — verifying current question"
             self.pending = {"id": str(uuid.uuid4()), "kind": "answer", "fingerprint": fingerprint,
-                            "answer": {k: answer[k] for k in ("option_ids", "text_answer")}}
+                            "answer": solved}
 
     def _queue_random(self, snapshot, reason):
         fingerprint = snapshot.get("fingerprint")
@@ -377,6 +468,8 @@ class Engine:
         option = secrets.choice(options)
         self.pending = {"id":str(uuid.uuid4()), "kind":"answer", "fingerprint":fingerprint,
                         "random_fallback":True, "answer":{"option_ids":[option["id"]], "text_answer":""}}
+        self.random_submission = {"id":self.pending["id"], "fingerprint":fingerprint, "generation":self.generation,
+                                  "class_run":self.class_run, "status":"queued", "answer":deepcopy(self.pending["answer"])}
         self.status = "Random fallback ready - verifying the current poll"
         self.alert_once("random:" + fingerprint, f"{reason} Random fallback selected {option['text'][:200]} and will attempt submission. This is a random choice, not a solved answer. You can change it while the poll is open.")
         return True

@@ -220,15 +220,28 @@ async function poll() {
         const prior = (settings.commandLedger||[]).find(entry=>entry.id===command.id);
         if(prior){pendingResult=prior.result||{id:command.id,ok:false,message:'This action was already started before a restart; it will not be repeated.'};}
         else {
-        const ledger=[...(settings.commandLedger||[]).slice(-49),{id:command.id,fingerprint:command.fingerprint}];
+        if(command.supersedes){
+          const original=(settings.commandLedger||[]).find(entry=>entry.id===command.supersedes);
+          if(!original?.random_fallback||original.fingerprint!==command.fingerprint||original.result?.ok!==true||JSON.stringify(original.answer)!==JSON.stringify(command.previous_answer))throw Error('The prior random submission is not confirmed in this extension. No replacement was attempted.');
+        }
+        const ledger=[...(settings.commandLedger||[]).slice(-49),{id:command.id,fingerprint:command.fingerprint,random_fallback:command.random_fallback===true,answer:command.answer}];
         await chrome.storage.local.set({commandLedger:ledger});
-        await page(settings.tabId, 'act', command,snapshot);
+        const actionResult=await page(settings.tabId, 'act', command,snapshot);
         let verified = false;
+        let receiptCleared=actionResult.receiptCleared===true;
         // Acknowledgment is explicit page state, never just a successful click.
         for (let attempt = 0; attempt < 8; attempt++) {
           await new Promise(resolve=>setTimeout(resolve,250));
           const after = await page(settings.tabId,'capture',null,{frameId:snapshot.frameId});
           if (command.kind === 'answer' && after.fingerprint !== command.fingerprint) break;
+          if(after.state!=='submitted')receiptCleared=true;
+          if(command.supersedes){
+            const expected=JSON.stringify(command.answer.option_ids);
+            if(after.selectedOptionIds?.length&&JSON.stringify(after.selectedOptionIds)!==expected)continue;
+            // A receipt left over from the random answer is not confirmation
+            // of a replacement. Require the new choice or a fresh receipt.
+            if(!receiptCleared&&JSON.stringify(after.receivedOptionIds)!==expected)continue;
+          }
           if (command.kind === 'join' ? ['waiting','question','submitted'].includes(after.state) : after.state === 'submitted') {
             verified = true;
             break;

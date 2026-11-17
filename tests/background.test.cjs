@@ -28,8 +28,9 @@ async function worker(options={}){
       actions.push(input.args[1]);
       if(options.actionFailure)throw Error('Question changed before submission');
       snapshot={...snapshot,state:'submitted'};
+      if(options.receiptOnAction)snapshot={...snapshot,...options.receiptOnAction};
       if(options.changeOnAction)snapshot.fingerprint='q2';
-      return [{result:{phase:'answer'}}];
+      return [{result:{phase:'answer',...(options.actionResult||{})}}];
     }},
     alarms:{create:()=>{},onAlarm:{addListener:fn=>events.alarm=fn}},
     runtime:{onStartup:{addListener:fn=>events.start=fn},onInstalled:{addListener:()=>{}},onMessage:{addListener:fn=>events.message=fn}}
@@ -46,6 +47,27 @@ async function worker(options={}){
   return {stored,requests,notifications,actions,events,executions,intervals,poll:()=>context.poll(),classify:value=>context.signalFromFrame(value),get attaches(){return attaches;},get workChecks(){return workChecks;}};
 }
 const answer={id:'command1',kind:'answer',fingerprint:'q1',answer:{option_ids:['option-1'],text_answer:''}};
+const correction={id:'correction1',kind:'answer',fingerprint:'q1',supersedes:'random1',previous_answer:{option_ids:['option-1'],text_answer:''},answer:{option_ids:['option-2'],text_answer:''}};
+const confirmedRandom={id:'random1',fingerprint:'q1',random_fallback:true,answer:correction.previous_answer,result:{id:'random1',ok:true}};
+test('a correction can replace a confirmed random action and verify its new receipt',async()=>{
+  let sent=false;const w=await worker({stored:{commandLedger:[confirmedRandom]},snapshot:{state:'submitted',receivedOptionIds:['option-1'],selectedOptionIds:['option-1']},receiptOnAction:{receivedOptionIds:['option-2'],selectedOptionIds:['option-2']},respond:()=>{if(!sent){sent=true;return {running:true,command:correction};}return {running:true};}});
+  w.stored.armed=true;await w.poll();assert.equal(w.actions.length,1);assert.equal(w.requests[1].result.ok,true);
+  await w.poll();assert.equal(w.actions.length,1);
+});
+test('the old random receipt alone cannot acknowledge a solved replacement',async()=>{
+  let sent=false;const w=await worker({stored:{commandLedger:[confirmedRandom]},snapshot:{state:'submitted',receivedOptionIds:['option-1']},receiptOnAction:{selectedOptionIds:['option-2']},respond:()=>{if(!sent){sent=true;return {running:true,command:correction};}return {running:true};}});
+  w.stored.armed=true;await w.poll();assert.equal(w.actions.length,1);assert.equal(w.requests[1].result.ok,false);
+});
+test('a fresh receipt following a cleared confirmation can verify an explicit correction',async()=>{
+  let sent=false;const w=await worker({stored:{commandLedger:[confirmedRandom]},snapshot:{state:'submitted'},actionResult:{receiptCleared:true},receiptOnAction:{selectedOptionIds:['option-2']},respond:()=>{if(!sent){sent=true;return {running:true,command:correction};}return {running:true};}});
+  w.stored.armed=true;await w.poll();assert.equal(w.requests[1].result.ok,true);
+});
+test('a correction needs the confirmed original random action in the ledger',async()=>{
+  for(const ledger of [[],[{...confirmedRandom,result:{ok:false}}],[{...confirmedRandom,random_fallback:false}],[{...confirmedRandom,fingerprint:'another-question'}]]){
+    let sent=false;const w=await worker({stored:{commandLedger:ledger},respond:()=>{if(!sent){sent=true;return {running:true,command:correction};}return {running:true};}});
+    w.stored.armed=true;await w.poll();assert.equal(w.actions.length,0);assert.equal(w.requests[1].result.ok,false);
+  }
+});
 
 test('unarmed worker does no page capture or network work',async()=>{const w=await worker();await w.poll();assert.equal(w.requests.length,0);assert.equal(w.attaches,0);});
 test('armed worker sends a complete snapshot and captured image',async()=>{const w=await worker();w.stored.armed=true;await w.poll();assert.equal(w.requests[0].snapshot.question,'What is 2+2?');assert.deepEqual(w.requests[0].snapshot.screenshots,['aW1hZ2U=']);});

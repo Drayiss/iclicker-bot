@@ -267,14 +267,115 @@ class EngineTests(unittest.TestCase):
         self.assertIsNone(self.poll(snapshot)["command"])
         self.assertEqual(self.engine.pool.calls,[])
 
-    def test_late_model_result_cannot_overwrite_a_queued_random_choice(self):
+    def test_solved_answer_replaces_a_random_choice_not_yet_dispatched(self):
         self.engine.config["random_fallback"]=True
         self.poll(question())
         self.engine._queue_random(question(),"Deadline is near")
-        identifier=self.engine.pending["id"]
         self.engine.pool.future.set_result(copy.deepcopy(ANSWER))
-        self.assertEqual(self.engine.pending["id"],identifier)
-        self.assertTrue(self.engine.pending["random_fallback"])
+        self.assertFalse(self.engine.pending.get("random_fallback", False))
+        self.assertEqual(self.engine.pending["answer"]["option_ids"],ANSWER["option_ids"])
+
+    def start_timed_random(self, acknowledge=True):
+        self.engine.config["random_fallback"] = True
+        with patch("time.monotonic", return_value=100):
+            self.poll(question())
+        with patch("time.monotonic", return_value=111):
+            self.assertFalse(self.engine.work_state()["ready"])
+        with patch("time.monotonic", return_value=112), patch("secrets.choice", side_effect=lambda options: options[1]):
+            self.assertTrue(self.engine.work_state()["ready"])
+            command = self.poll(question())["command"]
+        self.assertTrue(command["random_fallback"])
+        self.assertFalse(self.engine.pool.future.done())
+        if acknowledge:
+            with patch("time.monotonic", return_value=113):
+                self.poll(question(state="submitted", resubmittable=True, selectedOptionIds=["option-2"]), result={"id":command["id"], "ok":True})
+        return command
+
+    def test_15_second_solver_supersedes_12_second_confirmed_random_submission(self):
+        random = self.start_timed_random()
+        self.assertIn("solver still working",self.engine.status)
+        with patch("time.monotonic", return_value=115):
+            self.engine.pool.future.set_result(copy.deepcopy(ANSWER))
+            correction = self.poll(question(state="submitted", resubmittable=True, selectedOptionIds=["option-2"]))["command"]
+        self.assertEqual(correction["supersedes"],random["id"])
+        self.assertEqual(correction["previous_answer"]["option_ids"],["option-2"])
+        self.assertEqual(correction["answer"]["option_ids"],["option-1"])
+        self.assertEqual(len(self.engine.pool.calls),1)
+        self.poll(question(state="submitted", resubmittable=True, selectedOptionIds=["option-1"]), result={"id":correction["id"], "ok":True})
+        self.assertIsNone(self.poll(question(state="submitted", resubmittable=True))["command"])
+        self.assertEqual(self.engine._history_status("q1"),"submitted")
+        self.assertIn("replaced the random",self.engine.events[-1]["message"])
+        self.poll(question("q2"))
+        self.engine.pool.future.set_result(copy.deepcopy(ANSWER))
+        self.assertEqual(self.poll(question("q2"))["command"]["answer"]["option_ids"],["option-1"])
+
+    def test_solved_replacement_waits_for_random_acknowledgment(self):
+        random = self.start_timed_random(acknowledge=False)
+        with patch("time.monotonic", return_value=115):
+            self.engine.pool.future.set_result(copy.deepcopy(ANSWER))
+            self.assertEqual(self.engine.pending["id"],random["id"])
+            self.assertIsNone(self.poll(question())["command"])
+            self.assertIsNone(self.poll(question(state="submitted", resubmittable=True, selectedOptionIds=["option-2"]), result={"id":random["id"], "ok":True}, acknowledgmentOnly=True)["command"])
+            correction=self.poll(question(state="submitted", resubmittable=True, selectedOptionIds=["option-2"]))["command"]
+        self.assertEqual(correction["supersedes"],random["id"])
+
+    def test_same_solved_answer_as_random_is_not_submitted_twice(self):
+        self.start_timed_random()
+        answer=copy.deepcopy(ANSWER)
+        answer["option_ids"]=["option-2"]
+        self.engine.pool.future.set_result(answer)
+        self.assertIsNone(self.engine.pending)
+        self.assertEqual(self.engine.random_submission["status"],"complete")
+
+    def test_failed_random_acknowledgment_blocks_late_replacement(self):
+        random=self.start_timed_random(acknowledge=False)
+        self.poll(question(),result={"id":random["id"],"ok":False,"message":"Receipt unclear"})
+        self.engine.pool.future.set_result(copy.deepcopy(ANSWER))
+        self.assertIsNone(self.poll(question())["command"])
+
+    def test_closed_poll_does_not_receive_a_late_replacement(self):
+        self.start_timed_random()
+        self.poll(question(state="waiting"))
+        self.engine.pool.future.set_result(copy.deepcopy(ANSWER))
+        self.assertIsNone(self.engine.pending)
+
+    def test_a_new_question_cannot_receive_the_previous_random_correction(self):
+        self.start_timed_random()
+        self.poll(question("q2"))
+        self.engine.pool.future.set_result(copy.deepcopy(ANSWER))
+        self.assertIsNone(self.engine.pending)
+        self.assertIsNone(self.poll(question("q2"))["command"])
+        self.assertEqual(len(self.engine.pool.calls),2)
+
+    def test_manual_selection_change_is_not_overwritten_by_late_solver(self):
+        self.start_timed_random()
+        self.poll(question(state="submitted", resubmittable=True, selectedOptionIds=["manual-choice"]))
+        self.engine.pool.future.set_result(copy.deepcopy(ANSWER))
+        self.assertIsNone(self.engine.pending)
+        self.assertEqual(self.engine.random_submission["status"],"cancelled")
+
+    def test_random_wait_is_shortened_for_an_imminent_poll_deadline(self):
+        self.engine.config["random_fallback"]=True
+        with patch("time.monotonic",return_value=100):self.poll(question(remainingSeconds=8))
+        with patch("time.monotonic",return_value=104):self.assertFalse(self.engine.work_state()["ready"])
+        with patch("time.monotonic",return_value=105):self.assertTrue(self.engine.work_state()["ready"])
+
+    def test_failed_correction_is_not_retried(self):
+        self.start_timed_random()
+        self.engine.pool.future.set_result(copy.deepcopy(ANSWER))
+        correction=self.poll(question(state="submitted",resubmittable=True,selectedOptionIds=["option-2"]))["command"]
+        self.poll(question(state="submitted",resubmittable=True),result={"id":correction["id"],"ok":False,"message":"Receipt unclear"})
+        self.assertIsNone(self.poll(question(state="submitted",resubmittable=True))["command"])
+
+    def test_restart_does_not_replay_a_random_correction(self):
+        self.start_timed_random()
+        restarted=Engine(Path(self.directory.name))
+        try:
+            restarted.start()
+            self.assertIsNone(restarted.poll({"snapshot":question(state="submitted",resubmittable=True)})["command"])
+            self.assertIsNone(restarted.random_submission)
+        finally:
+            restarted.pool.shutdown()
 
     def test_network_hint_can_alert_about_an_unreadable_poll_but_cannot_submit(self):
         self.engine.config["random_fallback"]=True

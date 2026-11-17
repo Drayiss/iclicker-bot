@@ -55,6 +55,43 @@ function fixture({missing=false,ambiguous=false,multiple=false,textInput=false,d
   return {adapter:context.__iclickerBot,question,heading,submit,options,input,body,main,image,map,notifications,observers,listeners,create:(tag,text,attrs)=>new Element(tag,text,attrs),get submitted(){return submitted;},onDigest:fn=>digestHook=fn,mutate:()=>{observers[0].callback();for(const fn of timers.values())fn();timers.clear();},reinject:()=>vm.runInContext(source,context)};
 }
 const command=snapshot=>({kind:'answer',fingerprint:snapshot.fingerprint,answer:{option_ids:['option-1'],text_answer:''}});
+async function randomThenCorrection(f){
+  const snapshot=await f.adapter.capture({});
+  const random={...command(snapshot),id:'random-1',random_fallback:true};
+  await f.adapter.act(random,{});
+  return {snapshot,correction:{...command(snapshot),id:'solved-1',supersedes:random.id,previous_answer:random.answer,answer:{option_ids:['option-2'],text_answer:''}}};
+}
+
+test('a late solved answer replaces a native click-to-submit random answer',async()=>{
+  const f=fixture({nativeIclicker:true});const {snapshot,correction}=await randomThenCorrection(f);
+  const recorded=await f.adapter.capture({});assert.equal(recorded.resubmittable,true);assert.equal(recorded.fingerprint,snapshot.fingerprint);assert.deepEqual(Array.from(recorded.receivedOptionIds),['option-1']);
+  await f.adapter.act(correction,{});
+  assert.equal(f.submitted,2);assert.equal(f.options[1].checked,true);assert.deepEqual(Array.from((await f.adapter.capture({})).receivedOptionIds),['option-2']);
+});
+test('a late solved answer uses the explicit Submit button for resubmission',async()=>{
+  const f=fixture();const {correction}=await randomThenCorrection(f);
+  await f.adapter.act(correction,{});assert.equal(f.submitted,2);assert.equal(f.options[1].checked,true);
+});
+test('a correction cannot overwrite a manual selection after the random answer',async()=>{
+  const f=fixture({nativeIclicker:true});const {correction}=await randomThenCorrection(f);
+  f.options[1].click();await assert.rejects(f.adapter.act(correction,{}),/manual edit/);assert.equal(f.submitted,2);
+});
+test('an unsent manual edit also blocks a correction',async()=>{
+  const f=fixture();const {correction}=await randomThenCorrection(f);f.options[1].click();
+  await assert.rejects(f.adapter.act(correction,{}),/manual edit/);assert.equal(f.submitted,1);
+});
+test('a closed poll wins over an old Answer Received receipt',async()=>{
+  const f=fixture({nativeIclicker:true});const {correction}=await randomThenCorrection(f);f.body.innerText+='\nPoll is closed';
+  assert.equal((await f.adapter.capture({})).state,'waiting');await assert.rejects(f.adapter.act(correction,{}));assert.equal(f.submitted,1);
+});
+test('a new question cannot receive a correction to the old random answer',async()=>{
+  const f=fixture({nativeIclicker:true});const {correction}=await randomThenCorrection(f);f.heading.innerText='Question 2';
+  await assert.rejects(f.adapter.act(correction,{}),/Question changed/);assert.equal(f.submitted,1);
+});
+test('disabled options do not allow a late correction',async()=>{
+  const f=fixture({nativeIclicker:true});const {correction}=await randomThenCorrection(f);f.options.forEach(option=>option.disabled=true);
+  assert.equal((await f.adapter.capture({})).resubmittable,false);await assert.rejects(f.adapter.act(correction,{}));assert.equal(f.submitted,1);
+});
 
 test('captures complete question and every option',async()=>{const f=fixture();const snapshot=await f.adapter.capture({});assert.equal(snapshot.state,'question');assert.equal(snapshot.question,'What is 2 + 2?');assert.deepEqual(Array.from(snapshot.options,o=>o.text),['4','5']);assert.equal(snapshot.controlsClear,true);});
 test('absent text produces help request',async()=>{const f=fixture({missing:true});const snapshot=await f.adapter.capture({});assert.match(snapshot.problem,/question text is absent/);await assert.rejects(f.adapter.act(command(snapshot),{}));assert.equal(f.submitted,0);});

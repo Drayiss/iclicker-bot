@@ -1,10 +1,11 @@
 /* Isolated-world page adapter. Only rendered page elements supply question data. */
 (() => {
-  if (globalThis.__iclickerBot?.version === '1.3.0') return;
+  if (globalThis.__iclickerBot?.version === '1.4.0') return;
   let selectorErrors = [];
   const visible = e => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden' && getComputedStyle(e).display !== 'none' && !e.closest('[aria-hidden="true"]') && (typeof e.checkVisibility!=='function'||e.checkVisibility({opacityProperty:true,visibilityProperty:true}));
   const text = e => (e?.innerText || '').trim() || (e?.getAttribute('aria-label') || e?.getAttribute('title') || '').trim();
   const enabled = e => !e.disabled && e.getAttribute('aria-disabled') !== 'true';
+  const selected = e => !!e?.checked || e?.getAttribute('aria-checked') === 'true' || e?.getAttribute('aria-pressed') === 'true' || e?.getAttribute('aria-selected') === 'true' || !!e?.classList.contains('selected');
   const find = selector => {try{return selector ? [...document.querySelectorAll(selector)].filter(visible) : [];}catch{selectorErrors.push('A configured selector is invalid.');return [];}};
   const unique = selector => { const all = find(selector); return all.length === 1 ? all[0] : null; };
   function path(e) {
@@ -94,8 +95,8 @@
     else if (join) state = 'join';
     else if (history) state = 'history';
     else if (ended) state = 'ended';
-    else if (submitted) state = 'submitted';
     else if (pollClosed) state = 'waiting';
+    else if (submitted) state = 'submitted';
     else if (submit || input || options.length || questionNode) state = 'question';
     else if (active) state = 'waiting';
     else if (/class (?:has )?not started|no (?:active |live )?(?:class|session)|waiting for (?:the )?class|not in session/i.test(body) || (location.origin === 'https://student.iclicker.com' && /#\/courses\/[^/]+\/tab\/default/.test(location.href) && find('.course-wrapper').length)) state = 'idle';
@@ -117,10 +118,15 @@
     const timer = one(find('[role="timer"], [data-testid="poll-timer"], .poll-timer'));
     const timing = text(timer).match(/^(?:(\d{1,2}):)?(\d{1,2})(?:\s*(?:s|seconds?))?$/i) || body.match(/time (?:remaining|left)\s*:?\s*(?:(\d{1,2}):)?(\d{1,2})(?:\s*(?:s|seconds?))?/i);
     const remainingSeconds = timing ? Number(timing[1]||0)*60+Number(timing[2]) : null;
+    const selectedOptionIds = optionsNodes.flatMap((node,index)=>selected(node)?[options[index].id]:[]);
+    const receipt = body.match(/(?:answer|response) (?:has been |was )?(?:submitted|recorded|received)\s*[:\-–—]?\s*([^\n]*)/i);
+    const receivedValue = receipt?.[1]?.trim() || '';
+    const receivedOptionIds = options.filter(option=>receivedValue===option.text).map(option=>option.id);
+    const resubmittable = state === 'submitted' && !pollClosed && controlsClear && inputKind === 'single' && remainingSeconds !== 0 && (selectedOptionIds.length === 1 || receivedOptionIds.length === 1);
     // All rendered question text is passed without truncation. Do not include unrelated history/sidebar text.
     const context = questionNode?.closest('main,[role="main"],article') || questionNode;
     const visibleText = context ? text(context) : question;
-    return {state, question, questionSource, questionImage, questionId, options, inputKind, figures, visibleText, controlsClear, submitMode,remainingSeconds,recoveredSelectors,contentLoading,frameVisible:frameIsVisible(),
+    return {state, question, questionSource, questionImage, questionId, options, inputKind, figures, visibleText, controlsClear, submitMode,remainingSeconds,recoveredSelectors,contentLoading,selectedOptionIds,receivedOptionIds,resubmittable,frameVisible:frameIsVisible(),
       submitSelector: path(submit), inputSelector: path(input), joinSelector: path(join),
       url: location.href, sessionId: location.origin + location.pathname + location.hash.split('/questions')[0], problem,
       documentWidth: Math.max(document.documentElement.scrollWidth, innerWidth), documentHeight: Math.max(document.documentElement.scrollHeight, innerHeight)};
@@ -154,7 +160,15 @@
       return {phase:'join', fingerprint: before.fingerprint};
     }
     const randomFallback = command.random_fallback === true && before.inputKind === 'single' && before.options.length >= 2;
-    if (before.state !== 'question' || (!randomFallback && ((!before.question && before.questionSource !== 'visible_image') || before.problem)) || !before.controlsClear) throw Error('Question text or submission controls are no longer clear.');
+    const replacement = typeof command.supersedes === 'string' && !!command.supersedes;
+    const actionable = snapshot => snapshot.state === 'question' || (replacement && snapshot.state === 'submitted' && snapshot.resubmittable);
+    const checkPrevious = snapshot => {
+      const previous = command.previous_answer?.option_ids;
+      const recorded = snapshot.receivedOptionIds.length ? snapshot.receivedOptionIds : snapshot.selectedOptionIds;
+      if(snapshot.inputKind !== 'single' || !Array.isArray(previous) || previous.length !== 1 || command.previous_answer.text_answer || recorded.length !== 1 || recorded[0] !== previous[0] || (snapshot.selectedOptionIds.length && JSON.stringify(snapshot.selectedOptionIds) !== JSON.stringify(previous))) throw Error('The random answer is no longer the current selection, or it cannot be verified. A manual edit will not be overwritten.');
+    };
+    if (!actionable(before) || (!randomFallback && ((!before.question && before.questionSource !== 'visible_image') || before.problem)) || !before.controlsClear || before.remainingSeconds === 0) throw Error('Question text or submission controls are no longer clear.');
+    if(replacement)checkPrevious(before);
     const answer = command.answer;
     if (before.inputKind === 'text') {
       if (answer.option_ids.length || !answer.text_answer.trim()) throw Error('Invalid text answer.');
@@ -173,7 +187,8 @@
         // This click IS submission. Do not click any other option or hunt for a
         // second button. background.js must verify the page's acknowledgment.
         const current = read(selectors);
-        if (JSON.stringify(identity(current)) !== JSON.stringify(identity(before)) || current.state !== 'question' || (!randomFallback && current.problem) || !current.controlsClear || current.submitMode !== 'choice_click') throw Error('Question changed immediately before the answer click. Nothing was submitted.');
+        if (JSON.stringify(identity(current)) !== JSON.stringify(identity(before)) || !actionable(current) || (!randomFallback && current.problem) || !current.controlsClear || current.submitMode !== 'choice_click') throw Error('Question changed immediately before the answer click. Nothing was submitted.');
+        if(replacement)checkPrevious(current);
         const option = current.options.find(o=>o.id===ids[0]);
         const node = unique(option.selector);
         if (!node || !enabled(node) || label(node) !== option.text) throw Error('The single-choice answer control changed.');
@@ -183,31 +198,30 @@
       for (const option of before.options) {
         const node = unique(option.selector);
         if (!node || !enabled(node)) throw Error('An answer option is no longer available.');
-        const selected = !!node.checked || node.getAttribute('aria-checked') === 'true' || node.getAttribute('aria-pressed') === 'true';
+        const isSelected = selected(node);
         const wanted = ids.includes(option.id);
-        if ((before.inputKind === 'multiple' && selected !== wanted) || (before.inputKind === 'single' && wanted && !selected)) node.click();
+        if ((before.inputKind === 'multiple' && isSelected !== wanted) || (before.inputKind === 'single' && wanted && !isSelected)) node.click();
       }
     }
     // Give framework bindings a render turn, then check identity and selected values again.
     await new Promise(resolve=>setTimeout(resolve, 80));
     const after = await capture(selectors);
-    if (after.fingerprint !== command.fingerprint || after.state !== 'question' || !after.controlsClear || (!randomFallback && after.problem)) throw Error('Question or controls changed during answer entry. Submission status needs verification.');
+    if (after.fingerprint !== command.fingerprint || !actionable(after) || !after.controlsClear || (!randomFallback && after.problem)) throw Error('Question or controls changed during answer entry. Submission status needs verification.');
     if (after.inputKind !== 'text') {
       for (const option of after.options) {
         const node = unique(option.selector);
-        const selected = !!node?.checked || node?.getAttribute('aria-checked') === 'true' || node?.getAttribute('aria-pressed') === 'true' || node?.classList.contains('selected');
-        if (selected !== answer.option_ids.includes(option.id)) throw Error('The selected choices could not be verified. Please inspect the tab.');
+        if (selected(node) !== answer.option_ids.includes(option.id)) throw Error('The selected choices could not be verified. Please inspect the tab.');
       }
     }
     const current = read(selectors);
-    if (JSON.stringify(identity(current)) !== JSON.stringify(identity(before)) || current.state !== 'question' || (!randomFallback && current.problem) || !current.controlsClear) throw Error('Question changed immediately before submission. Nothing was submitted.');
+    if (JSON.stringify(identity(current)) !== JSON.stringify(identity(before)) || !actionable(current) || (!randomFallback && current.problem) || !current.controlsClear || current.remainingSeconds === 0) throw Error('Question changed immediately before submission. Nothing was submitted.');
     if (current.inputKind === 'text' && unique(current.inputSelector)?.value !== answer.text_answer) throw Error('Text input changed before submission. Nothing was submitted.');
     const submit = unique(current.submitSelector);
     if (!submit || !enabled(submit)) throw Error('Submission control is unavailable.');
     submit.click();
-    return {phase:'answer', fingerprint: before.fingerprint};
+    return {phase:'answer', fingerprint: before.fingerprint, receiptCleared: current.state === 'question'};
   }
-  globalThis.__iclickerBot = {version:'1.3.0',capture, act};
+  globalThis.__iclickerBot = {version:'1.4.0',capture, act};
   // DOM/route changes supplement the three-second timer. Semantic comparison
   // ignores unrelated countdown ticks and cookie-banner updates.
   if (typeof MutationObserver !== 'undefined' && globalThis.chrome?.runtime) {
