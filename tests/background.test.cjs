@@ -18,9 +18,14 @@ async function worker(options={}){
     action:{setBadgeText:async()=>{},setBadgeBackgroundColor:async()=>{}},
     notifications:{create:async message=>notifications.push(message)},
     tabs:{get:async()=>{if(options.browserFailure)throw Error('Selected tab is closed');return {url:'https://student.iclicker.com/#/polling'};},query:async()=>options.availableTabs||[],onUpdated:{addListener:fn=>events.route=fn}},
-    debugger:{attach:async()=>{attaches++;if(options.attachFailure)throw Error('Debugger already attached');},getTargets:async()=>[],detach:async()=>{},sendCommand:async(_target,method)=>{if(method==='Network.enable'&&options.networkUnavailable)throw Error('Network events unavailable');if(method==='Page.getLayoutMetrics'&&options.foreignDebugger)throw Error('Not attached to this extension');if(method==='Page.captureScreenshot'){if(options.captureFailure)throw Error('Screenshot failed');return {data:'aW1hZ2U='};}return {};},onDetach:{addListener:fn=>events.detach=fn},onEvent:{addListener:fn=>events.network=fn}},
+    debugger:{attach:async()=>{attaches++;if(options.attachFailure)throw Error(options.attachError||'Debugger already attached');},getTargets:async()=>[],detach:async()=>{},sendCommand:async(_target,method)=>{if(method==='Network.enable'&&options.networkUnavailable)throw Error('Network events unavailable');if(method==='Page.getLayoutMetrics'&&options.metricsError)throw Error(options.metricsError);if(method==='Page.getLayoutMetrics'&&options.foreignDebugger)throw Error('Not attached to this extension');if(method==='Page.captureScreenshot'){if(options.captureFailure)throw Error('Screenshot failed');return {data:'aW1hZ2U='};}return {};},onDetach:{addListener:fn=>events.detach=fn},onEvent:{addListener:fn=>events.network=fn}},
     scripting:{executeScript:async input=>{
       executions.push(input);
+      if(input.func?.name==='listExtensionFrames'){
+        if(options.diagnosticFailure)throw Error('Main frame unavailable');
+        const inspect=vm.runInNewContext('('+input.func.toString()+')',{URL,location:{href:'https://student.iclicker.com/#/polling'},document:{querySelectorAll:()=> (options.extensionFrames||[]).map(src=>({getAttribute:()=>src}))}});
+        return [{result:inspect(input.args[0])}];
+      }
       if(input.target.allFrames&&options.frameProbeFailure)throw Error('Frames not accessible');
       if(input.files)return [];
       if(input.target.allFrames&&options.frames)return clone(options.frames);
@@ -33,7 +38,7 @@ async function worker(options={}){
       return [{result:{phase:'answer',...(options.actionResult||{})}}];
     }},
     alarms:{create:()=>{},onAlarm:{addListener:fn=>events.alarm=fn}},
-    runtime:{onStartup:{addListener:fn=>events.start=fn},onInstalled:{addListener:()=>{}},onMessage:{addListener:fn=>events.message=fn}}
+    runtime:{id:'a'.repeat(32),onStartup:{addListener:fn=>events.start=fn},onInstalled:{addListener:()=>{}},onMessage:{addListener:fn=>events.message=fn}}
   };
   const context=vm.createContext({chrome,URL,AbortSignal,fetch:async(_url,input)=>{
     if(_url.endsWith('/api/work')){workChecks++;return {ok:true,json:async()=>options.workState||{ready:true,solving:false,running:true}};}
@@ -98,3 +103,30 @@ test('a generic polling URL is not enough to reconnect to the intended class',as
 test('a ready solver answer wakes inspection without waiting for the three-second timer',async()=>{let sent=false;const w=await worker({respond:()=>{if(!sent){sent=true;return {running:true,workPending:true};}return {running:true};}});w.stored.armed=true;await w.poll();await settle();assert.ok(w.workChecks>=1);assert.ok(w.requests.length>=2);});
 test('actions are bound to the captured iframe document ID',async()=>{let sent=false;const w=await worker({frames:[{frameId:4,documentId:'doc-4',result:{state:'question',question:'What is 2+2?',fingerprint:'q1',controlsClear:true,frameVisible:true,documentWidth:900,documentHeight:600}}],respond:()=>{if(!sent){sent=true;return {running:true,command:answer};}return {running:true};}});w.stored.armed=true;await w.poll();const action=w.executions.find(call=>call.args?.[0]==='act');assert.deepEqual(Array.from(action.target.documentIds),['doc-4']);});
 test('regular inspection runs every three seconds',async()=>{const w=await worker();assert.ok(w.intervals.includes(3000));assert.equal(w.intervals.includes(5000),false);});
+const crossExtensionError='Cannot access a chrome-extension:// URL of different extension';
+test('cross-extension debugger failure identifies visible foreign frame IDs and recovery steps',async()=>{
+  const id='b'.repeat(32);
+  const w=await worker({attachFailure:true,foreignDebugger:true,attachError:crossExtensionError,extensionFrames:[`chrome-extension://${id}/overlay.html?secret=DO_NOT_LOG`,`chrome-extension://${id}/duplicate.html`,`chrome-extension://${'a'.repeat(32)}/own.html`,'https://example.test/frame']});
+  const result=await new Promise(resolve=>w.events.message({type:'arm',tabId:1,token:'test-token'},{},resolve));
+  assert.equal(result.ok,false);assert.match(result.error,/Edge blocked debugger access/);assert.match(result.error,/edge:\/\/extensions/);assert.match(result.error,/reuse the same pairing code/);
+  assert.equal(result.error.split(id).length-1,1);assert.equal(result.error.includes('a'.repeat(32)),false);assert.equal(result.error.includes('DO_NOT_LOG'),false);assert.equal(result.error.includes('overlay.html'),false);
+  assert.equal(w.stored.connectionError,result.error);assert.equal(w.stored.lastScan.state,'access_error');assert.equal(w.stored.lastStatus,'Connection blocked');assert.equal(w.actions.length,0);
+  const diagnostic=w.executions.find(input=>input.func?.name==='listExtensionFrames');assert.deepEqual(Array.from(diagnostic.target.frameIds),[0]);assert.equal(diagnostic.target.allFrames,undefined);
+});
+test('frame diagnostics failing still shows the actionable debugger error',async()=>{
+  const w=await worker({attachFailure:true,foreignDebugger:true,attachError:crossExtensionError,diagnosticFailure:true});w.stored.armed=true;await w.poll();
+  assert.match(w.requests[0].error,/Edge blocked debugger access/);assert.equal(w.requests[0].error.includes('Main frame unavailable'),false);assert.equal(w.actions.length,0);
+});
+test('a recovered connection clears a saved connection failure',async()=>{
+  const w=await worker({stored:{connectionError:'Old failure'}});w.stored.armed=true;await w.poll();assert.equal(w.stored.connectionError,'');assert.equal(w.stored.lastScan.state,'question');
+});
+test('foreign frame diagnostics are deduplicated and capped without exposing paths',async()=>{
+  const frames=Array.from({length:12},(_,index)=>`chrome-extension://${String.fromCharCode(98+index).repeat(32)}/secret-path`);
+  const w=await worker({attachFailure:true,foreignDebugger:true,attachError:crossExtensionError,extensionFrames:frames});w.stored.armed=true;await w.poll();
+  const message=w.requests[0].error;assert.equal((message.match(/[a-p]{32}/g)||[]).length,10);assert.equal(message.includes('secret-path'),false);
+});
+test('cross-extension errors during an existing connection also get recovery guidance',async()=>{
+  const options={extensionFrames:[`chrome-extension://${'b'.repeat(32)}/frame.html`]};
+  const w=await worker(options);w.stored.armed=true;await w.poll();options.metricsError=crossExtensionError;await w.poll();
+  assert.match(w.requests.at(-1).error,/Edge blocked debugger access/);assert.match(w.requests.at(-1).error,/b{32}/);assert.equal(w.stored.lastScan.state,'access_error');
+});

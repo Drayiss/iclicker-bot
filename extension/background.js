@@ -76,6 +76,7 @@ function stableClassUrl(value) {
 }
 
 async function localAlert(message) {
+  await chrome.storage.local.set({connectionError:message});
   await chrome.action.setBadgeText({text:'!'});
   await chrome.action.setBadgeBackgroundColor({color:'#bb3344'});
   if (lastFailure !== message) {
@@ -91,6 +92,29 @@ async function post(token, payload) {
 async function inPage(operation,arg,selectors) {
     if (!globalThis.__iclickerBot) throw Error('Page adapter is not loaded.');
     return operation === 'capture' ? globalThis.__iclickerBot.capture(selectors) : globalThis.__iclickerBot.act(arg,selectors);
+}
+function listExtensionFrames(ownId) {
+  // Read only iframe URLs exposed by the permitted class page. Never enter a
+  // foreign extension's frame or attempt to remove it to bypass the restriction.
+  const ids=new Set();
+  for(const frame of document.querySelectorAll('iframe[src], frame[src]')){
+    try {
+      const url=new URL(frame.getAttribute('src'),location.href);
+      if(['chrome-extension:','edge-extension:'].includes(url.protocol)&&url.hostname!==ownId&&/^[a-p]{32}$/.test(url.hostname))ids.add(url.hostname);
+    } catch {}
+    if(ids.size>=10)break;
+  }
+  return [...ids];
+}
+async function debuggerAccessError(tabId,error) {
+  if(!/Cannot access a (?:chrome|edge)-extension:\/\/ URL of different extension/i.test(error.message||''))return error;
+  let ids=[];
+  try {
+    const [result]=await chrome.scripting.executeScript({target:{tabId,frameIds:[0]},func:listExtensionFrames,args:[chrome.runtime.id]});
+    ids=Array.isArray(result?.result)?result.result:[];
+  } catch {} // A diagnostic failure must not hide the original access error.
+  const details=ids.length?` Extension frame IDs found in this page: ${ids.join(', ')}.`:'';
+  return Error('Edge blocked debugger access to another extension\'s page/frame. In edge://extensions, temporarily disable extensions that add content to the iClicker page, reload the class tab, then reconnect. You can reuse the same pairing code.'+details);
 }
 async function page(tabId, operation, arg, frame={}) {
   const target={tabId};
@@ -197,8 +221,10 @@ async function poll() {
       }
       snapshot.signals={wake:lastWake,network:networkEnabled?'available':'unavailable',lastEvent:lastSignal?{...lastSignal,ageSeconds:Math.round((Date.now()-lastSignal.receivedAt)/1000)}:null};
     } catch (error) {
-      const message = `Browser/login/access failure: ${error.message}`;
+      const failure=await debuggerAccessError(settings.tabId,error);
+      const message = `Browser/login/access failure: ${failure.message}`;
       await localAlert(message);
+      await chrome.storage.local.set({lastStatus:'Connection blocked',lastScan:{checkedAt:Date.now(),state:'access_error',problem:message}});
       const response = await post(settings.token, {error:message,result:pendingResult});
       if (response.selectors) currentSelectors = response.selectors;
       return;
@@ -211,7 +237,7 @@ async function poll() {
     lastFailure = '';
     await chrome.action.setBadgeText({text:response.running ? 'ON' : '||'});
     await chrome.action.setBadgeBackgroundColor({color:response.running ? '#26846d' : '#667085'});
-    await chrome.storage.local.set({lastStatus:`${snapshot.state} · ${new Date().toLocaleTimeString()}`,selectors:currentSelectors,lastScan:{checkedAt:Date.now(),state:snapshot.state,problem:snapshot.problem||snapshot.captureProblem||'',source:snapshot.questionSource,options:snapshot.options?.length||0,submitMode:snapshot.submitMode,recoveredSelectors:snapshot.recoveredSelectors||[],frame:snapshot.frameId,frameProbe:snapshot.frameProbe,signals:snapshot.signals}});
+    await chrome.storage.local.set({connectionError:'',lastStatus:`${snapshot.state} · ${new Date().toLocaleTimeString()}`,selectors:currentSelectors,lastScan:{checkedAt:Date.now(),state:snapshot.state,problem:snapshot.problem||snapshot.captureProblem||'',source:snapshot.questionSource,options:snapshot.options?.length||0,submitMode:snapshot.submitMode,recoveredSelectors:snapshot.recoveredSelectors||[],frame:snapshot.frameId,frameProbe:snapshot.frameProbe,signals:snapshot.signals}});
     const command = response.command;
     if (command && response.running) {
       try {
@@ -284,12 +310,13 @@ chrome.runtime.onMessage.addListener((message,sender,reply)=>{
   if (message.type === 'arm') {
     (async()=>{
       try {
+        if(busy)throw Error('A connection check is already in progress. Wait a moment, then reconnect.');
         if (selectedTab && selectedTab !== message.tabId) {
           const previous = selectedTab;
           selectedTab = undefined;
           await chrome.debugger.detach({tabId:previous}).catch(()=>{});
         }
-        await chrome.storage.local.set({token:message.token,tabId:message.tabId,armed:true,bindingUrl:null,tabUrl:null});
+        await chrome.storage.local.set({token:message.token,tabId:message.tabId,armed:true,bindingUrl:null,tabUrl:null,connectionError:'',lastStatus:''});
         screenshotKey = ''; screenshotData = []; lastFailure = '';
         schedule(); await poll(); reply({ok:!lastFailure,error:lastFailure});
       } catch(error) { reply({ok:false,error:error.message}); }
@@ -298,7 +325,7 @@ chrome.runtime.onMessage.addListener((message,sender,reply)=>{
   }
   if (message.type === 'disarm') {
     (async()=>{
-      await chrome.storage.local.set({armed:false});
+      await chrome.storage.local.set({armed:false,connectionError:''});
       if (selectedTab) await chrome.debugger.detach({tabId:selectedTab}).catch(()=>{});
       selectedTab = undefined;
       clearInterval(timer);

@@ -1,6 +1,6 @@
 {
   "name": "iclicker-bot",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "private": true,
   "description": "Windows iClicker experimental monitor and Edge extension",
   "engines": {"node": ">=26.13.1 <27"},

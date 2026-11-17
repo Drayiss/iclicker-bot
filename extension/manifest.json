@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "iClicker Bot — Experimental Monitor",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Pairs a selected iClicker tab with your local PC app. Checks every three seconds.",
   "minimum_chrome_version": "120",
   "permissions": ["activeTab", "tabs", "scripting", "storage", "debugger", "alarms", "notifications"],
